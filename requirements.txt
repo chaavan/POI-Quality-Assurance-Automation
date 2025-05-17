@@ -3,6 +3,3 @@ dspy
 pydantic
 bs4
 requests
-time
-json
-traceback

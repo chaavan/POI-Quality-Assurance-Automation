@@ -1,6 +1,6 @@
 streamlit
 dspy
-pydantic!
+pydantic
 bs4
 requests
 time

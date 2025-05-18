@@ -14,7 +14,7 @@ from overturemaps import core
 
 # ─── DSPY & LLM SETUP ─────────────────────────────────────────────────────────
 # lm will be configured in the Streamlit app based on user input
-lm = None 
+lm = None
 
 # ─── UTILS ───────────────────────────────────────────────────────────────────
 
@@ -161,8 +161,9 @@ class POIQAPipeline:
         if self.call_count % self.rate_limit == 0:
             # This message goes to the console where Streamlit server is running.
             # The Streamlit app UI will appear to hang during the sleep.
-            print(f"[RATE LIMIT] {self.call_count} LLM calls made—sleeping 60s…")
+            pause_msg = st.warning(f"⚠️ Rate limit reached ({self.call_count} calls). Pausing 60s …")
             time.sleep(60)
+            pause_msg.empty()
         return result
 
     def validate_one(self, record: Dict[str, Any], selected_qa: List[str]) -> Dict[str, Any]:
@@ -222,7 +223,7 @@ class POIQAPipeline:
         for i, rec1_simple in enumerate(simplified_places):
             for j, rec2_simple in enumerate(simplified_places[i+1:]):
                 # Pass original names for reporting, but simplified records for detection
-                res = self._api_call(self.duplicate_detector.forward, rec1_simple, rec2_simple)
+                res =self.duplicate_detector.forward (rec1_simple, rec2_simple)
                 if res.get("duplicate"): # Check if 'duplicate' key exists and is True
                     dups.append((places[i]["name"], places[i+1+j]["name"], res.get("reason", "No reason provided")))
         return dups
@@ -267,8 +268,7 @@ def streamlit_app():
     global lm
     if api_key_input:
         try:
-            lm = dspy.LM(
-                model='gemini-1.5-flash-latest', # Using a common Gemini model
+            lm = dspy.LM('gemini/gemini-2.0-flash', # Using a common Gemini model
                 api_key=api_key_input,
                 max_tokens=1000 # Example, adjust as needed
             )

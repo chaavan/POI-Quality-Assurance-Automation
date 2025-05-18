@@ -286,7 +286,7 @@ def streamlit_app():
     bbox_str = st.text_input(
         "Enter Bounding Box (min_lon, min_lat, max_lon, max_lat):", 
         default_bbox,
-        help="Example: -117.003, 33.05, -117, 33.1"
+        help="Example: -117.005, 33.05, -117.003, 33.1"
     )
 
     st.header("🔍 QA Verifications")

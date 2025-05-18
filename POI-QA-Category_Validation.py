@@ -1,280 +1,410 @@
+# projectd.py
 # -*- coding: utf-8 -*-
-import streamlit as st
-import dspy
-from pydantic import BaseModel # Required by dspy.Signature
-from bs4 import BeautifulSoup
-import requests
-import time
-import json
-import traceback
 
-# Overture Maps imports
+import streamlit as st
+import json
+import time
+import requests
+from bs4 import BeautifulSoup
+from typing import List, Dict, Any
+import pandas as pd
+
+import dspy
 from overturemaps import core
 
-# --- Configuration & LLM Setup ---
-# IMPORTANT: For a deployed app, use st.secrets to store your API key.
-# Example: API_KEY = st.secrets["GEMINI_API_KEY"]
-# For local development, you can use an environment variable or input field.
-# For this example, we'll use a text input in the sidebar for the API key.
+# ─── DSPY & LLM SETUP ─────────────────────────────────────────────────────────
+# lm will be configured in the Streamlit app based on user input
+lm = None 
 
-st.set_page_config(layout="wide")
-st.title("🌍 POI Category Validator")
-st.markdown("""
-Validate Point of Interest (POI) categories using Overture Maps data, website scraping, 
-and a Large Language Model (LLM) via DSPy.
-""")
+# ─── UTILS ───────────────────────────────────────────────────────────────────
 
-# --- DSPy Signatures and Modules ---
+def scrape_website(url: str, timeout: float = 5.0) -> str:
+    """Fetches title, meta-description, and H1s from a URL, returns as single string."""
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        title = soup.title.string if soup.title else 'No title'
+        desc_tag = soup.find('meta', {'name': 'description'})
+        desc = desc_tag['content'] if desc_tag and 'content' in desc_tag.attrs else ''
+
+        h1s = '; '.join(h.get_text(strip=True) for h in soup.find_all('h1'))
+        return f"Title: {title}. Description: {desc}. H1s: {h1s}"
+    except Exception as e:
+        # This warning will go to the console where Streamlit is running
+        print(f"[WARN] scrape_website({url}) failed:", e)
+        return ""
+
+def scrape_place_website(place_name: str, urls: List[str]) -> str:
+    """Scrape the first URL in the `urls` list, if any."""
+    if not urls:
+        return ""
+    first_url = urls[0]
+    if not first_url or not isinstance(first_url, str): # Ensure it's a non-empty string
+        return ""
+    return scrape_website(first_url)
+
+# ─── DSPY SIGNATURE & MODULE ─────────────────────────────────────────────────
+
+# Category Validation
 class CategoryValidation(dspy.Signature):
-    """Determine if the category of a POI is correct and suggest correction if needed.
-    Consider the POI name, its current category, and scraped information from its website.
-    If the category seems incorrect, suggest a more appropriate one.
-    If correct, confirm it. If unsure, state that.
-    Provide a concise response.
-    """
-    poi_name: str = dspy.InputField(desc="The name of the Point of Interest.")
-    poi_description: str = dspy.InputField(desc="Information scraped from the POI's website (e.g., title, meta description, headings).")
-    current_category: str = dspy.InputField(desc="The current category assigned to the POI.")
-    response: str = dspy.OutputField(desc="Validation result: 'Correct', 'Incorrect, suggest: [new_category]', or 'Unsure'.")
+    """Is the current category correct? If not, suggest one."""
+    poi_name: str = dspy.InputField()
+    poi_description: str = dspy.InputField()
+    current_category: str = dspy.InputField()
+    response: str = dspy.OutputField()
 
 class CategoryValidator(dspy.Module):
     def __init__(self):
         super().__init__()
         self.query = dspy.Predict(CategoryValidation)
 
-    def forward(self, poi_name, poi_description, current_category):
-        # Ensure inputs are strings, as dspy can be sensitive
-        poi_name_str = str(poi_name) if poi_name is not None else "N/A"
-        poi_description_str = str(poi_description) if poi_description is not None else "No description available."
-        current_category_str = str(current_category) if current_category is not None else "N/A"
-        
-        return self.query(
-            poi_name=poi_name_str,
-            poi_description=poi_description_str,
-            current_category=current_category_str
-        ).response
+    def forward(
+            self, 
+            poi_name: str, 
+            poi_description: str, 
+            current_category: str) -> str:
+        out = self.query(
+            poi_name=poi_name,
+            poi_description=poi_description,
+            current_category=current_category
+        )
+        return out.response
 
-# --- Helper Functions ---
-@st.cache_data(ttl=3600) # Cache scraping results for 1 hour
-def scrape_website(url, timeout=10):
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+# Completeness Check
+class CompletenessCheck(dspy.Signature):
+    """Check which required fields are missing from a POI record."""
+    record: Dict[str, Any]     = dspy.InputField()
+    required_fields: List[str] = dspy.InputField()
+    missing_fields: List[str]  = dspy.OutputField()
+    model_config = {"arbitrary_types_allowed": True}
+
+class CompletenessChecker(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.query = dspy.Predict(CompletenessCheck)
+
+    def forward(self, record: dict, required_fields: List[str]) -> List[str]:
+        out = self.query(
+            record=record, 
+            required_fields=required_fields
+            )
+        return out.missing_fields
+
+# Address Formatting
+class AddressFormat(dspy.Signature):
+    """Given an address string, correct its formatting if necessary or return the original if correct."""
+    address: str = dspy.InputField()
+    corrected: str = dspy.OutputField()
+
+class AddressFormatter(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.query = dspy.Predict(AddressFormat)
+
+    def forward(self, address: str) -> str:
+        out = self.query(
+            address=address
+            )
+        return out.corrected
+
+# Duplicate Detection
+class DuplicateDetection(dspy.Signature):
+    """Decide if two POI records refer to the same real-world place."""
+    rec1: Dict[str, str] = dspy.InputField()
+    rec2: Dict[str, str] = dspy.InputField()
+    is_duplicate: bool = dspy.OutputField()
+    reason: str = dspy.OutputField()
+    model_config = {"arbitrary_types_allowed": True}
+
+class DuplicateDetector(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.query = dspy.Predict(DuplicateDetection)
+
+    def forward(self, rec1: dict, rec2: dict) -> Dict[str, Any]:
+        out = self.query(
+            rec1=rec1, 
+            rec2=rec2
+            )
+        return {"duplicate": out.is_duplicate, "reason": out.reason}
+
+# ─── PIPELINE & ORCHESTRATION ────────────────────────────────────────────────
+
+class POIQAPipeline:
+    """Orchestrates scraping + QA modules based on selection."""
+
+    def __init__(
+            self, 
+            validator: CategoryValidator,
+            completeness: CompletenessChecker,
+            formatter: AddressFormatter,
+            duplicate_detector: DuplicateDetector
+            ):
+        self.validator = validator
+        self.completeness = completeness
+        self.formatter = formatter
+        self.duplicate_detector = duplicate_detector
+
+        self.call_count = 0
+        self.rate_limit = 15 # Number of LLM calls before pausing
+    
+    def _api_call(self, fn, *args):
+        """Wrapper: call the module fn, increment counter, pause if rate limit hit."""
+        if not dspy.settings.lm:
+            st.error("LLM not configured. Cannot make API call.")
+            raise Exception("LLM not configured for API call.")
+        
+        result = fn(*args)
+        self.call_count += 1
+        if self.call_count % self.rate_limit == 0:
+            # This message goes to the console where Streamlit server is running.
+            # The Streamlit app UI will appear to hang during the sleep.
+            print(f"[RATE LIMIT] {self.call_count} LLM calls made—sleeping 60s…")
+            time.sleep(60)
+        return result
+
+    def validate_one(self, record: Dict[str, Any], selected_qa: List[str]) -> Dict[str, Any]:
+        name       = record.get("name", "")
+        category   = record.get("category", "")
+        urls       = record.get("websites", []) # This is List[str]
+        addresses  = record.get("addresses", [])
+
+        # Initialize result with name, and default "Not performed" for all QA fields
+        result = {
+            "name": name,
+            "category_suggestion": "Not performed",
+            "missing_fields": "Not performed",
+            "corrected_address": "Not performed"
         }
-        response = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
 
-        title = soup.title.string.strip() if soup.title and soup.title.string else 'No title found'
+        # 1. Scrape description (only if Category Validation is selected)
+        desc = ""
+        if "Category Validation" in selected_qa:
+            desc = scrape_place_website(name, urls)
+            cat_suggestion = self._api_call(self.validator.forward, name, desc, category)
+            result["category_suggestion"] = cat_suggestion
         
-        meta_desc_tag = soup.find('meta', attrs={'name': 'description'})
-        meta_desc = meta_desc_tag.get('content', '').strip() if meta_desc_tag else ''
-        
-        h1_tags = [tag.get_text(strip=True) for tag in soup.find_all('h1')]
-        h1_text = '; '.join(h1_tags) if h1_tags else ''
+        # 2. Completeness Check
+        if "Completeness Check" in selected_qa:
+            required = ["name","category","websites","socials","emails","phones","addresses"]
+            missing = self._api_call(self.completeness.forward, record, required)
+            result["missing_fields"] = missing if missing else [] # Ensure it's a list
 
-        # Extract some body text, focusing on meaningful paragraphs
-        paragraphs = soup.find_all('p')
-        body_preview_parts = []
-        char_count = 0
-        for p in paragraphs:
-            p_text = p.get_text(strip=True)
-            if p_text:
-                body_preview_parts.append(p_text)
-                char_count += len(p_text)
-                if char_count > 500: # Limit body preview length
-                    break
-        body_preview = ' '.join(body_preview_parts)
-
-        scraped_text = f"Title: {title}. Meta Description: {meta_desc}. Headings: {h1_text}. Body Preview: {body_preview}"
-        return scraped_text.strip()
-
-    except requests.exceptions.Timeout:
-        return f"Failed to Scrape (Timeout): {url}"
-    except requests.exceptions.RequestException as e:
-        return f"Failed to Scrape ({type(e).__name__}): {url}"
-    except Exception as e:
-        return f"An unexpected error occurred while scraping {url}: {type(e).__name__}"
-
-@st.cache_data(ttl=3600) # Cache Overture Maps data for 1 hour
-def get_overture_places(_bbox_tuple):
-    try:
-        gdf = core.geodataframe("place", bbox=_bbox_tuple)
-        return gdf
-    except Exception as e:
-        st.error(f"Error fetching data from Overture Maps: {e}")
-        return None
-
-# --- Streamlit UI ---
-# Sidebar for inputs
-st.sidebar.header("⚙️ Input Parameters")
-
-# API Key Input
-api_key_input = st.sidebar.text_input(
-    "🔑 Gemini API Key", 
-    type="password", 
-    help="Enter your Google AI Studio API Key for Gemini. Your key is not stored."
-)
-
-# Bbox input
-st.sidebar.subheader("📍 Bounding Box")
-min_lon = st.sidebar.number_input("Min Longitude (XMin)", value=-117.0500, format="%.4f")
-min_lat = st.sidebar.number_input("Min Latitude (YMin)", value=33.0500, format="%.4f")
-max_lon = st.sidebar.number_input("Max Longitude (XMax)", value=-117.0000, format="%.4f")
-max_lat = st.sidebar.number_input("Max Latitude (YMax)", value=33.1000, format="%.4f")
-
-# Max POIs to process
-max_pois_to_process_all = st.sidebar.slider(
-    "Max POIs to Process", 0, 500, 10, 
-    help="Set to 0 to process all found POIs (can be slow and costly)."
-)
-
-# Rate Limiting Configuration
-st.sidebar.subheader("⏱️ API Rate Limiting")
-calls_before_pause = st.sidebar.slider("LLM Calls Before Pause", 1, 30, 10, help="Number of LLM calls before a pause.")
-pause_duration = st.sidebar.slider("Pause Duration (seconds)", 10, 120, 60, help="Duration of pause to respect API limits.")
-
-
-if st.sidebar.button("🚀 Validate POIs", use_container_width=True):
-    if not api_key_input:
-        st.error("❌ Please enter your Gemini API Key in the sidebar.")
-        st.stop()
-
-    try:
-        lm = dspy.LM('gemini/gemini-2.0-flash', api_key=api_key_input)
-        dspy.configure(lm=lm)
-        st.success("✅ LLM Configured with Gemini API Key.")
-    except Exception as e:
-        st.error(f"❌ Failed to initialize LLM. Check your API key. Error: {e}")
-        st.stop()
-
-    bbox_input = (min_lon, min_lat, max_lon, max_lat)
-    if not (bbox_input[0] < bbox_input[2] and bbox_input[1] < bbox_input[3]):
-        st.error("❌ Invalid bounding box: Min coordinates must be less than Max coordinates.")
-        st.stop()
-
-    all_results_data = []
-    
-    main_status = st.status(f"Processing POIs for Bbox: {bbox_input}...", expanded=True)
-    
-    progress_bar_container = main_status.empty()
-    current_poi_status_text = main_status.empty()
-    results_log_container = main_status.container(height=300) # Scrollable log
-
-    try:
-        main_status.write("Fetching data from Overture Maps...")
-        gdf = get_overture_places(bbox_input)
-
-        if gdf is None or gdf.empty:
-            main_status.warning("No places found for the given bounding box or error fetching data.")
-            st.stop()
-
-        main_status.write(f"Found {len(gdf)} places in the bounding box.")
-
-        validator = CategoryValidator()
-
-        num_to_process = len(gdf)
-        if max_pois_to_process_all > 0:
-            num_to_process = min(len(gdf), max_pois_to_process_all)
-            main_status.write(f"Processing up to {num_to_process} POIs based on user setting.")
-        
-        if num_to_process == 0:
-            main_status.info("No POIs to process.")
-            st.stop()
-
-        api_call_counter = 0
-
-        for i_places in range(num_to_process):
-            # API Rate Limiting
-            if api_call_counter > 0 and api_call_counter % calls_before_pause == 0:
-                current_poi_status_text.info(f"Pausing for {pause_duration}s (API rate limit)... {api_call_counter} calls made.")
-                time.sleep(pause_duration)
-
-            place_data = gdf.iloc[i_places]
+        # 3. Address Formatting
+        if "Address Formatting" in selected_qa:
+            first_addr_dict = addresses[0] if addresses and isinstance(addresses[0], dict) else {}
+            first_addr_str = first_addr_dict.get("freeform", "") if first_addr_dict else ""
             
-            current_poi_name = "N/A"
-            if place_data.get('names') and isinstance(place_data['names'], dict) and 'primary' in place_data['names']:
-                current_poi_name = place_data['names']['primary']
-            elif place_data.get('names') and isinstance(place_data['names'], dict) and 'common' in place_data['names'] and place_data['names']['common']:
-                 current_poi_name = place_data['names']['common'][0]
+            if first_addr_str:
+                corrected_address = self._api_call(self.formatter.forward, first_addr_str)
+                result["corrected_address"] = corrected_address
             else:
-                current_poi_name = f"Unnamed POI (ID: {place_data.get('id', 'Unknown')})"
-
-            current_poi_status_text.text(f"POI {i_places + 1}/{num_to_process}: {current_poi_name}")
-            progress_bar_container.progress((i_places + 1) / num_to_process)
-
-            # Scrape website
-            scraped_description = "No website information available or not applicable."
-            website_url = None
-            websites_list = place_data.get('websites')
-            if websites_list and isinstance(websites_list, list) and len(websites_list) > 0:
-                website_url = websites_list[0] 
-                if website_url and isinstance(website_url, str) and website_url.startswith("http"):
-                    results_log_container.write(f" scraping {website_url}...")
-                    scraped_description = scrape_website(website_url)
-                    results_log_container.write(f"  -> Scraped: {scraped_description[:100]}...")
-                else:
-                    scraped_description = f"Invalid or missing website URL: {website_url}"
-                    results_log_container.write(f"  -> {scraped_description}")
-            
-            current_cat = "N/A"
-            categories_data = place_data.get('categories')
-            if categories_data and isinstance(categories_data, dict) and 'primary' in categories_data:
-                current_cat = categories_data['primary']
-            elif categories_data and isinstance(categories_data, dict) and 'alternate' in categories_data and categories_data['alternate']:
-                current_cat = categories_data['alternate'][0]
-
-            # LLM Validation
-            llm_response_text = "LLM call skipped or failed."
-            try:
-                results_log_container.write(f" validating with LLM...")
-                llm_response = validator(
-                    poi_name=current_poi_name,
-                    poi_description=scraped_description,
-                    current_category=current_cat
-                )
-                llm_response_text = llm_response
-                api_call_counter += 1
-                results_log_container.write(f"  -> LLM says: {llm_response_text}")
-            except Exception as e:
-                llm_response_text = f"LLM Error: {str(e)[:200]}"
-                results_log_container.error(f"LLM validation error for {current_poi_name}: {e}")
-
-            result_entry = {
-                "overture_id": place_data.get('id', 'Unknown'),
-                "poi_name": current_poi_name,
-                "website_url": website_url if website_url else "N/A",
-                "scraped_content_summary": scraped_description,
-                "current_category": current_cat,
-                "llm_validation_response": llm_response_text
-            }
-            all_results_data.append(result_entry)
-
-        main_status.update(label="🎉 Processing complete!", state="complete", expanded=False)
+                result["corrected_address"] = "No address to format"
         
-        st.subheader("📊 Results Summary")
-        st.dataframe(all_results_data)
+        return result
+    
+    def detect_duplicates(self, places: List[dict]) -> List[tuple]:
+        dups = []
+        # For duplicate detection, we need string representations of records.
+        # Let's simplify records to include only key textual fields for comparison.
+        def simplify_record(rec):
+            return {
+                "name": str(rec.get("name", "")),
+                "category": str(rec.get("category", "")),
+                "address": str(rec.get("addresses")[0].get("freeform", "") if rec.get("addresses") else ""),
+                "website": str(rec.get("websites")[0] if rec.get("websites") else "")
+            }
 
-        if all_results_data:
-            json_string = json.dumps(all_results_data, indent=4)
-            # Sanitize bbox for filename
-            bbox_str = "_".join(map(str, bbox_input)).replace(".", "p")
+        simplified_places = [simplify_record(p) for p in places]
+
+        for i, rec1_simple in enumerate(simplified_places):
+            for j, rec2_simple in enumerate(simplified_places[i+1:]):
+                # Pass original names for reporting, but simplified records for detection
+                res = self._api_call(self.duplicate_detector.forward, rec1_simple, rec2_simple)
+                if res.get("duplicate"): # Check if 'duplicate' key exists and is True
+                    dups.append((places[i]["name"], places[i+1+j]["name"], res.get("reason", "No reason provided")))
+        return dups
+    
+    def run(self, places: List[dict], selected_qa: List[str]) -> Dict[str, Any]:
+        qa_results = []
+        
+        # Perform single-record validations if any are selected
+        single_record_qa_selected = any(item in selected_qa for item in ["Category Validation", "Completeness Check", "Address Formatting"])
+
+        if single_record_qa_selected:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            for i, rec in enumerate(places):
+                status_text.text(f"Validating POI {i+1}/{len(places)}: {rec.get('name', 'Unnamed POI')}")
+                qa_results.append(self.validate_one(rec, selected_qa))
+                progress_bar.progress((i + 1) / len(places))
+            status_text.text(f"Validated {len(places)} POIs.")
+            progress_bar.empty()
+
+        duplicates_result = []
+        if "Duplicate Detection" in selected_qa:
+            with st.spinner("Detecting duplicates... This may take a while for many POIs."):
+                duplicates_result = self.detect_duplicates(places)
+        
+        return {"qa": qa_results, "duplicates": duplicates_result}
+
+# ─── STREAMLIT APP ───────────────────────────────────────────────────────────
+def streamlit_app():
+    st.set_page_config(layout="wide")
+    st.title("🌍 Overture POI Quality Assurance Tool")
+
+    st.sidebar.header("⚙️ Configuration")
+    # It's better to use st.secrets for API keys in deployed apps
+    api_key_input = st.sidebar.text_input(
+        "Gemini API Key", 
+        type="password", 
+        value="", # Encourage user to input their own key
+        help="Enter your Google AI Studio Gemini API Key."
+    )
+    
+    global lm
+    if api_key_input:
+        try:
+            lm = dspy.LM(
+                model='gemini-1.5-flash-latest', # Using a common Gemini model
+                api_key=api_key_input,
+                max_tokens=1000 # Example, adjust as needed
+            )
+            dspy.configure(lm=lm)
+            st.sidebar.success("LLM Configured!")
+        except Exception as e:
+            st.sidebar.error(f"LLM Config Error: {e}")
+            st.stop()
+    else:
+        st.sidebar.warning("Please enter your Gemini API Key to proceed.")
+        st.stop()
+
+    st.header("📍 Bounding Box Input")
+    default_bbox = "-117.003, 33.05, -117.002, 33.051" # Smaller default for faster testing
+    bbox_str = st.text_input(
+        "Enter Bounding Box (min_lon, min_lat, max_lon, max_lat):", 
+        default_bbox,
+        help="Example: -117.003, 33.05, -117, 33.1"
+    )
+
+    st.header("🔍 QA Verifications")
+    available_qa = [
+        "Category Validation",
+        "Completeness Check",
+        "Address Formatting",
+        "Duplicate Detection"
+    ]
+    selected_qa = st.multiselect(
+        "Select QA Verifications to perform:", 
+        available_qa, 
+        default=available_qa # Select all by default
+    )
+
+    if st.button("🚀 Run QA on POIs", type="primary"):
+        if not bbox_str:
+            st.error("❗ Please enter a bounding box.")
+            st.stop()
+        if not selected_qa:
+            st.error("❗ Please select at least one QA verification.")
+            st.stop()
+        if not dspy.settings.lm:
+            st.error("❗ LLM not configured. Please check API Key in sidebar.")
+            st.stop()
+
+        try:
+            bbox_parts = [float(p.strip()) for p in bbox_str.split(',')]
+            if len(bbox_parts) != 4:
+                raise ValueError("BBOX must have 4 parts.")
+            bbox = tuple(bbox_parts)
+        except ValueError as e:
+            st.error(f"Invalid BBOX format: {e}. Expected 'min_lon, min_lat, max_lon, max_lat'")
+            st.stop()
+
+        with st.spinner(f"Fetching Overture Places data for BBOX: {bbox}..."):
+            try:
+                gdf = core.geodataframe("place", bbox=bbox)
+                if gdf.empty:
+                    st.warning(f"No places found for the BBOX: {bbox}. Try a different area.")
+                    st.stop()
+                st.info(f"🗺️ Loaded {gdf.shape[0]} places from Overture Maps.")
+            except Exception as e:
+                st.error(f"Error fetching Overture data: {e}")
+                st.stop()
+        
+        places = []
+        for i in range(len(gdf)):
+            try:
+                name = gdf.names[i]['common'][0]['value'] if gdf.names[i] and gdf.names[i].get('common') else \
+                       (gdf.names[i]['primary'] if gdf.names[i] and gdf.names[i].get('primary') else f"Unnamed POI {gdf.id[i]}")
+                
+                record = {
+                    "id": gdf.id[i],
+                    "name": name,
+                    "category": gdf.categories[i]["primary"] if gdf.categories[i] and "primary" in gdf.categories[i] else "N/A",
+                    "confidence": gdf.confidence[i] if gdf.confidence[i] is not None else 0.0,
+                    "websites": gdf.websites[i] if gdf.websites[i] else [],
+                    "socials": gdf.socials[i] if gdf.socials[i] else [],
+                    "emails": gdf.emails[i] if gdf.emails[i] else [],
+                    "phones": gdf.phones[i] if gdf.phones[i] else [],
+                    "brand": gdf.brand[i].get("names", {}).get("common", [{}])[0].get("value", "N/A") if gdf.brand[i] and gdf.brand[i].get("names") else "N/A",
+                    "addresses": gdf.addresses[i] if gdf.addresses[i] else [] # List of address dicts
+                }
+                places.append(record)
+            except Exception as e:
+                st.warning(f"Skipping record {gdf.id[i] if hasattr(gdf, 'id') and len(gdf.id) > i else 'unknown ID'} due to parsing error: {e}")
+        
+        if not places:
+            st.warning("No processable POI records were created from the Overture data. This might be due to data format issues or an empty GDF.")
+            st.stop()
+
+        pipeline = POIQAPipeline(
+            validator=CategoryValidator(),
+            completeness=CompletenessChecker(),
+            formatter=AddressFormatter(),
+            duplicate_detector=DuplicateDetector()
+        )
+        
+        st.info(f"⏳ Running selected QA: {', '.join(selected_qa)}. This may take some time...")
+        if pipeline.rate_limit > 0 :
+             st.caption(f"ℹ️ Note: The process might pause for 60 seconds if more than {pipeline.rate_limit-1} LLM calls are made, due to API rate limiting.")
+
+        output = pipeline.run(places, selected_qa) 
+
+        st.header("📊 Results")
+        results_for_download = {}
+
+        if "qa" in output and output["qa"]:
+            st.subheader("QA Verifications")
+            qa_df = pd.DataFrame(output["qa"])
+            st.dataframe(qa_df)
+            results_for_download["qa_verifications"] = qa_df.to_dict(orient='records')
+        
+        if "duplicates" in output and output["duplicates"]:
+            st.subheader("👯 Potential Duplicates")
+            if output["duplicates"]:
+                for idx, (a, b, reason) in enumerate(output["duplicates"]):
+                    st.write(f"   cặp {idx+1}: **{a}** ↔️ **{b}** (Reason: {reason})")
+            else:
+                st.info("No potential duplicates found based on the selected criteria.")
+            results_for_download["potential_duplicates"] = output["duplicates"]
+        elif "Duplicate Detection" in selected_qa: # If selected but no duplicates found
+            st.subheader("👯 Potential Duplicates")
+            st.info("No potential duplicates found.")
+            results_for_download["potential_duplicates"] = []
+
+
+        if results_for_download:
+            json_string = json.dumps(results_for_download, indent=4, ensure_ascii=False)
             st.download_button(
                 label="📥 Download All Results as JSON",
                 data=json_string,
-                file_name=f"poi_validation_results_bbox_{bbox_str}.json",
-                mime="application/json",
-                use_container_width=True
+                file_name=f"poi_qa_results_{bbox_str.replace(',', '_').replace(' ', '')}.json",
+                mime="application/json"
             )
+        else:
+            st.info("No results generated to download for the selected QA tasks.")
 
-    except requests.exceptions.Timeout:
-        main_status.error("A website scraping request timed out. Please try again or adjust timeout in code.")
-    except Exception as e:
-        main_status.error(f"An unexpected error occurred: {e}")
-        st.error(traceback.format_exc())
-
-else:
-    st.info("Adjust parameters in the sidebar and click '🚀 Validate POIs' to begin.")
-
-st.markdown("---")
-st.markdown("Built with ❤️ by Chaavan, Cyrus and Copilot using Streamlit, Overture Maps, and DSPy.")
+if __name__ == "__main__":
+    streamlit_app()
